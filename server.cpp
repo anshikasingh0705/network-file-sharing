@@ -1,4 +1,4 @@
-// server.cpp - File Sharing Server (Day 3: File Download)
+// server.cpp - File Sharing Server (Day 4: File Upload)
 #include <iostream>
 #include <cstring>
 #include <sys/socket.h>
@@ -172,7 +172,6 @@ private:
         
         std::string filepath = std::string(SHARED_DIR) + "/" + filename;
         
-        // Check if file exists and is readable
         std::ifstream file(filepath, std::ios::binary);
         if (!file.is_open()) {
             sendMessage("ERROR: File not found or cannot be opened\n");
@@ -180,12 +179,10 @@ private:
             return;
         }
         
-        // Get file size
         file.seekg(0, std::ios::end);
         long filesize = file.tellg();
         file.seekg(0, std::ios::beg);
         
-        // Check if it's a directory
         struct stat st;
         if (stat(filepath.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
             sendMessage("ERROR: Cannot download directories\n");
@@ -196,7 +193,6 @@ private:
         std::cout << "📤 Starting download: " << filename 
                   << " (" << formatFileSize(filesize) << ")" << std::endl;
         
-        // Send file metadata
         std::ostringstream metadata;
         metadata << "OK\n";
         metadata << "FILESIZE:" << filesize << "\n";
@@ -204,7 +200,6 @@ private:
         metadata << "START\n";
         sendMessage(metadata.str());
         
-        // Wait for client acknowledgment
         char ack[10] = {0};
         read(client_socket, ack, sizeof(ack));
         
@@ -214,7 +209,6 @@ private:
             return;
         }
         
-        // Send file in chunks
         char buffer[CHUNK_SIZE];
         long bytes_sent = 0;
         int chunk_count = 0;
@@ -232,7 +226,6 @@ private:
                 bytes_sent += sent;
                 chunk_count++;
                 
-                // Progress indicator
                 int progress = (bytes_sent * 100) / filesize;
                 if (chunk_count % 100 == 0 || bytes_sent >= filesize) {
                     std::cout << "Progress: " << progress << "% (" 
@@ -245,6 +238,107 @@ private:
         file.close();
         std::cout << "\n✓ Download complete: " << filename 
                   << " (" << bytes_sent << " bytes sent)" << std::endl;
+    }
+
+    void handleUpload(const std::string& filename) {
+        if (filename.empty()) {
+            sendMessage("ERROR: Filename required\n");
+            return;
+        }
+        
+        // Send ready signal to receive metadata
+        sendMessage("READY\n");
+        
+        // Receive file metadata
+        char buffer[BUFFER_SIZE] = {0};
+        int bytes_read = read(client_socket, buffer, BUFFER_SIZE);
+        
+        if (bytes_read <= 0) {
+            std::cerr << "Failed to receive file metadata" << std::endl;
+            return;
+        }
+        
+        std::string metadata(buffer);
+        
+        // Parse metadata
+        std::istringstream iss(metadata);
+        std::string line;
+        long filesize = 0;
+        std::string recv_filename;
+        bool start_found = false;
+        
+        while (std::getline(iss, line)) {
+            if (line.find("FILESIZE:") != std::string::npos) {
+                filesize = std::stol(line.substr(9));
+            } else if (line.find("FILENAME:") != std::string::npos) {
+                recv_filename = line.substr(9);
+            } else if (line.find("START") != std::string::npos) {
+                start_found = true;
+                break;
+            }
+        }
+        
+        if (!start_found || filesize == 0) {
+            sendMessage("ERROR: Invalid metadata\n");
+            return;
+        }
+        
+        std::cout << "📥 Receiving upload: " << recv_filename 
+                  << " (" << formatFileSize(filesize) << ")" << std::endl;
+        
+        // Open file for writing
+        std::string filepath = std::string(SHARED_DIR) + "/" + recv_filename;
+        std::ofstream outfile(filepath, std::ios::binary);
+        
+        if (!outfile.is_open()) {
+            sendMessage("ERROR: Cannot create file\n");
+            std::cerr << "Failed to create file: " << filepath << std::endl;
+            return;
+        }
+        
+        // Send acknowledgment
+        send(client_socket, "READY", 5, 0);
+        
+        // Receive file data
+        long bytes_received = 0;
+        char data_buffer[CHUNK_SIZE];
+        int chunk_count = 0;
+        
+        while (bytes_received < filesize) {
+            memset(data_buffer, 0, CHUNK_SIZE);
+            
+            long remaining = filesize - bytes_received;
+            int to_read = (remaining < CHUNK_SIZE) ? remaining : CHUNK_SIZE;
+            
+            int received = read(client_socket, data_buffer, to_read);
+            
+            if (received <= 0) {
+                std::cerr << "\nError receiving file data" << std::endl;
+                outfile.close();
+                sendMessage("ERROR: Upload failed\n");
+                return;
+            }
+            
+            outfile.write(data_buffer, received);
+            bytes_received += received;
+            chunk_count++;
+            
+            // Progress indicator
+            int progress = (bytes_received * 100) / filesize;
+            if (chunk_count % 100 == 0 || bytes_received >= filesize) {
+                std::cout << "Progress: " << progress << "% (" 
+                          << formatFileSize(bytes_received) << " / " 
+                          << formatFileSize(filesize) << ")\r" << std::flush;
+            }
+        }
+        
+        outfile.close();
+        
+        std::cout << "\n✓ Upload complete: " << recv_filename 
+                  << " (" << bytes_received << " bytes received)" << std::endl;
+        
+        // Send success confirmation
+        sendMessage("OK: Upload successful\n");
     }
 
     void sendMessage(const std::string& message) {
@@ -271,12 +365,18 @@ private:
             iss >> filename;
             handleDownload(filename);
         }
+        else if (cmd == "UPLOAD") {
+            std::string filename;
+            iss >> filename;
+            handleUpload(filename);
+        }
         else if (cmd == "HELP") {
             std::string help = 
                 "Available Commands:\n"
                 "  LIST              - List all files in shared directory\n"
                 "  INFO <file>       - Get detailed info about a file\n"
                 "  DOWNLOAD <file>   - Download a file from server\n"
+                "  UPLOAD <file>     - Upload a file to server\n"
                 "  HELP              - Show this help message\n"
                 "  EXIT              - Disconnect from server\n";
             sendMessage(help);
@@ -295,7 +395,6 @@ public:
     }
 
     bool initialize() {
-        // Create shared directory if it doesn't exist
         struct stat st = {0};
         if (stat(SHARED_DIR, &st) == -1) {
             if (mkdir(SHARED_DIR, 0755) == 0) {
@@ -410,7 +509,7 @@ public:
 };
 
 int main() {
-    std::cout << "=== File Sharing Server (Day 3) ===" << std::endl;
+    std::cout << "=== File Sharing Server (Day 4) ===" << std::endl;
     
     FileServer server;
     server.run();
