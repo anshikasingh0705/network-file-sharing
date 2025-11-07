@@ -1,4 +1,4 @@
-// client.cpp - File Sharing Client (Day 2: File Listing)
+// client.cpp - File Sharing Client (Day 3: File Download)
 #include <iostream>
 #include <cstring>
 #include <sys/socket.h>
@@ -6,15 +6,33 @@
 #include <unistd.h>
 #include <string>
 #include <sstream>
+#include <fstream>
+#include <iomanip>
 
 #define PORT 8080
 #define BUFFER_SIZE 4096
+#define DOWNLOAD_DIR "./downloads"
 
 class FileClient {
 private:
     int sock;
     struct sockaddr_in serv_addr;
     bool connected;
+
+    std::string formatFileSize(long bytes) {
+        const char* units[] = {"B", "KB", "MB", "GB"};
+        int unit = 0;
+        double size = bytes;
+        
+        while (size >= 1024 && unit < 3) {
+            size /= 1024;
+            unit++;
+        }
+        
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(2) << size << " " << units[unit];
+        return oss.str();
+    }
 
     void sendCommand(const std::string& command) {
         send(sock, command.c_str(), command.length(), 0);
@@ -37,10 +55,11 @@ private:
         std::cout << "\n╔════════════════════════════════════════╗" << std::endl;
         std::cout << "║    File Sharing Client - Menu          ║" << std::endl;
         std::cout << "╠════════════════════════════════════════╣" << std::endl;
-        std::cout << "║  1. LIST   - List all files            ║" << std::endl;
-        std::cout << "║  2. INFO   - Get file information      ║" << std::endl;
-        std::cout << "║  3. HELP   - Show server commands      ║" << std::endl;
-        std::cout << "║  4. EXIT   - Disconnect                ║" << std::endl;
+        std::cout << "║  1. LIST     - List all files          ║" << std::endl;
+        std::cout << "║  2. INFO     - Get file information    ║" << std::endl;
+        std::cout << "║  3. DOWNLOAD - Download a file         ║" << std::endl;
+        std::cout << "║  4. HELP     - Show server commands    ║" << std::endl;
+        std::cout << "║  5. EXIT     - Disconnect              ║" << std::endl;
         std::cout << "╚════════════════════════════════════════╝" << std::endl;
         std::cout << "\nEnter command or number: ";
     }
@@ -74,6 +93,127 @@ private:
         }
     }
 
+    void handleDownloadCommand() {
+        std::cout << "\nEnter filename to download: ";
+        std::string filename;
+        std::getline(std::cin, filename);
+        
+        if (filename.empty()) {
+            std::cout << "Error: Filename cannot be empty" << std::endl;
+            return;
+        }
+        
+        // Create downloads directory if it doesn't exist
+        system(("mkdir -p " + std::string(DOWNLOAD_DIR)).c_str());
+        
+        std::cout << "\n📥 Requesting download: " << filename << std::endl;
+        
+        // Send download command
+        std::string command = "DOWNLOAD " + filename + "\n";
+        sendCommand(command);
+        
+        // Receive metadata
+        char buffer[BUFFER_SIZE] = {0};
+        int bytes_read = read(sock, buffer, BUFFER_SIZE);
+        
+        if (bytes_read <= 0) {
+            std::cout << "✗ Server disconnected" << std::endl;
+            connected = false;
+            return;
+        }
+        
+        std::string response(buffer);
+        
+        // Check for errors
+        if (response.find("ERROR") != std::string::npos) {
+            std::cout << response << std::endl;
+            return;
+        }
+        
+        // Parse metadata
+        std::istringstream iss(response);
+        std::string line;
+        long filesize = 0;
+        std::string recv_filename;
+        bool start_found = false;
+        
+        while (std::getline(iss, line)) {
+            if (line.find("FILESIZE:") != std::string::npos) {
+                filesize = std::stol(line.substr(9));
+            } else if (line.find("FILENAME:") != std::string::npos) {
+                recv_filename = line.substr(9);
+            } else if (line.find("START") != std::string::npos) {
+                start_found = true;
+                break;
+            }
+        }
+        
+        if (!start_found || filesize == 0) {
+            std::cout << "Error: Invalid file metadata received" << std::endl;
+            return;
+        }
+        
+        std::cout << "File size: " << formatFileSize(filesize) 
+                  << " (" << filesize << " bytes)" << std::endl;
+        std::cout << "Saving to: " << DOWNLOAD_DIR << "/" << recv_filename << std::endl;
+        
+        // Send acknowledgment
+        send(sock, "READY", 5, 0);
+        
+        // Open file for writing
+        std::string filepath = std::string(DOWNLOAD_DIR) + "/" + recv_filename;
+        std::ofstream outfile(filepath, std::ios::binary);
+        
+        if (!outfile.is_open()) {
+            std::cout << "Error: Cannot create file for writing" << std::endl;
+            return;
+        }
+        
+        // Receive file data
+        long bytes_received = 0;
+        char data_buffer[BUFFER_SIZE];
+        
+        std::cout << "\n🔄 Downloading..." << std::endl;
+        std::cout << "Progress: [" << std::flush;
+        
+        int last_progress = -1;
+        
+        while (bytes_received < filesize) {
+            memset(data_buffer, 0, BUFFER_SIZE);
+            
+            long remaining = filesize - bytes_received;
+            int to_read = (remaining < BUFFER_SIZE) ? remaining : BUFFER_SIZE;
+            
+            int received = read(sock, data_buffer, to_read);
+            
+            if (received <= 0) {
+                std::cout << "\n✗ Error receiving file data" << std::endl;
+                outfile.close();
+                return;
+            }
+            
+            outfile.write(data_buffer, received);
+            bytes_received += received;
+            
+            // Progress bar
+            int progress = (bytes_received * 50) / filesize; // 50 characters wide
+            if (progress != last_progress) {
+                for (int i = last_progress + 1; i <= progress; i++) {
+                    std::cout << "=" << std::flush;
+                }
+                last_progress = progress;
+            }
+        }
+        
+        std::cout << "] 100%" << std::endl;
+        outfile.close();
+        
+        std::cout << "\n✓ Download complete!" << std::endl;
+        std::cout << "  File saved: " << filepath << std::endl;
+        std::cout << "  Size: " << formatFileSize(bytes_received) 
+                  << " (" << bytes_received << " bytes)" << std::endl;
+    }
+
     void handleHelpCommand() {
         std::cout << "\n📖 Requesting help from server...\n" << std::endl;
         sendCommand("HELP\n");
@@ -85,13 +225,12 @@ private:
     }
 
     std::string normalizeCommand(const std::string& input) {
-        // Convert menu numbers to commands
         if (input == "1") return "LIST";
         if (input == "2") return "INFO";
-        if (input == "3") return "HELP";
-        if (input == "4") return "EXIT";
+        if (input == "3") return "DOWNLOAD";
+        if (input == "4") return "HELP";
+        if (input == "5") return "EXIT";
         
-        // Convert to uppercase for consistency
         std::string upper = input;
         for (char& c : upper) {
             c = toupper(c);
@@ -105,7 +244,6 @@ public:
     }
 
     bool connectToServer(const char* server_ip = "127.0.0.1") {
-        // Create socket
         if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
             std::cerr << "✗ Socket creation error" << std::endl;
             return false;
@@ -114,13 +252,11 @@ public:
         serv_addr.sin_family = AF_INET;
         serv_addr.sin_port = htons(PORT);
 
-        // Convert address
         if (inet_pton(AF_INET, server_ip, &serv_addr.sin_addr) <= 0) {
             std::cerr << "✗ Invalid address / Address not supported" << std::endl;
             return false;
         }
 
-        // Connect
         if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
             std::cerr << "✗ Connection failed" << std::endl;
             std::cerr << "  Make sure the server is running on " << server_ip 
@@ -135,7 +271,6 @@ public:
     }
 
     void run() {
-        // Read welcome message
         std::string welcome = receiveResponse();
         if (!welcome.empty()) {
             std::cout << "\n" << welcome;
@@ -158,6 +293,9 @@ public:
             }
             else if (command == "INFO") {
                 handleInfoCommand();
+            }
+            else if (command == "DOWNLOAD") {
+                handleDownloadCommand();
             }
             else if (command == "HELP") {
                 handleHelpCommand();
@@ -187,7 +325,7 @@ public:
 
 int main(int argc, char const *argv[]) {
     std::cout << "╔════════════════════════════════════════╗" << std::endl;
-    std::cout << "║   File Sharing Client (Day 2)          ║" << std::endl;
+    std::cout << "║   File Sharing Client (Day 3)          ║" << std::endl;
     std::cout << "╚════════════════════════════════════════╝" << std::endl;
     
     const char* server_ip = "127.0.0.1";

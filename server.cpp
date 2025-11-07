@@ -1,4 +1,4 @@
-// server.cpp - File Sharing Server (Day 2: File Listing)
+// server.cpp - File Sharing Server (Day 3: File Download)
 #include <iostream>
 #include <cstring>
 #include <sys/socket.h>
@@ -11,10 +11,12 @@
 #include <string>
 #include <sstream>
 #include <iomanip>
+#include <fstream>
 
 #define PORT 8080
 #define BUFFER_SIZE 4096
 #define SHARED_DIR "./shared_files"
+#define CHUNK_SIZE 4096
 
 struct FileInfo {
     std::string name;
@@ -30,7 +32,6 @@ private:
     struct sockaddr_in address;
     int addrlen;
 
-    // Get file size in bytes
     long getFileSize(const std::string& filepath) {
         struct stat st;
         if (stat(filepath.c_str(), &st) == 0) {
@@ -39,7 +40,6 @@ private:
         return 0;
     }
 
-    // Get human-readable file size
     std::string formatFileSize(long bytes) {
         const char* units[] = {"B", "KB", "MB", "GB"};
         int unit = 0;
@@ -55,7 +55,6 @@ private:
         return oss.str();
     }
 
-    // Get permissions string
     std::string getPermissions(const std::string& filepath) {
         struct stat st;
         if (stat(filepath.c_str(), &st) != 0) {
@@ -77,7 +76,6 @@ private:
         return perms;
     }
 
-    // List files in shared directory
     std::vector<FileInfo> listFiles() {
         std::vector<FileInfo> files;
         DIR* dir = opendir(SHARED_DIR);
@@ -89,7 +87,6 @@ private:
         
         struct dirent* entry;
         while ((entry = readdir(dir)) != nullptr) {
-            // Skip . and ..
             if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
                 continue;
             }
@@ -109,7 +106,6 @@ private:
         return files;
     }
 
-    // Handle LIST command
     void handleList() {
         std::vector<FileInfo> files = listFiles();
         
@@ -141,7 +137,6 @@ private:
         sendMessage(response.str());
     }
 
-    // Handle INFO command
     void handleInfo(const std::string& filename) {
         if (filename.empty()) {
             sendMessage("ERROR: Filename required\n");
@@ -169,12 +164,93 @@ private:
         sendMessage(response.str());
     }
 
-    // Send message to client
+    void handleDownload(const std::string& filename) {
+        if (filename.empty()) {
+            sendMessage("ERROR: Filename required\n");
+            return;
+        }
+        
+        std::string filepath = std::string(SHARED_DIR) + "/" + filename;
+        
+        // Check if file exists and is readable
+        std::ifstream file(filepath, std::ios::binary);
+        if (!file.is_open()) {
+            sendMessage("ERROR: File not found or cannot be opened\n");
+            std::cerr << "Failed to open file: " << filepath << std::endl;
+            return;
+        }
+        
+        // Get file size
+        file.seekg(0, std::ios::end);
+        long filesize = file.tellg();
+        file.seekg(0, std::ios::beg);
+        
+        // Check if it's a directory
+        struct stat st;
+        if (stat(filepath.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
+            sendMessage("ERROR: Cannot download directories\n");
+            file.close();
+            return;
+        }
+        
+        std::cout << "📤 Starting download: " << filename 
+                  << " (" << formatFileSize(filesize) << ")" << std::endl;
+        
+        // Send file metadata
+        std::ostringstream metadata;
+        metadata << "OK\n";
+        metadata << "FILESIZE:" << filesize << "\n";
+        metadata << "FILENAME:" << filename << "\n";
+        metadata << "START\n";
+        sendMessage(metadata.str());
+        
+        // Wait for client acknowledgment
+        char ack[10] = {0};
+        read(client_socket, ack, sizeof(ack));
+        
+        if (strncmp(ack, "READY", 5) != 0) {
+            std::cerr << "Client not ready to receive file" << std::endl;
+            file.close();
+            return;
+        }
+        
+        // Send file in chunks
+        char buffer[CHUNK_SIZE];
+        long bytes_sent = 0;
+        int chunk_count = 0;
+        
+        while (!file.eof() && bytes_sent < filesize) {
+            file.read(buffer, CHUNK_SIZE);
+            std::streamsize bytes_read = file.gcount();
+            
+            if (bytes_read > 0) {
+                ssize_t sent = send(client_socket, buffer, bytes_read, 0);
+                if (sent < 0) {
+                    std::cerr << "Error sending file data" << std::endl;
+                    break;
+                }
+                bytes_sent += sent;
+                chunk_count++;
+                
+                // Progress indicator
+                int progress = (bytes_sent * 100) / filesize;
+                if (chunk_count % 100 == 0 || bytes_sent >= filesize) {
+                    std::cout << "Progress: " << progress << "% (" 
+                              << formatFileSize(bytes_sent) << " / " 
+                              << formatFileSize(filesize) << ")\r" << std::flush;
+                }
+            }
+        }
+        
+        file.close();
+        std::cout << "\n✓ Download complete: " << filename 
+                  << " (" << bytes_sent << " bytes sent)" << std::endl;
+    }
+
     void sendMessage(const std::string& message) {
         send(client_socket, message.c_str(), message.length(), 0);
     }
 
-    // Process command from client
     void processCommand(const std::string& command) {
         std::istringstream iss(command);
         std::string cmd;
@@ -190,13 +266,19 @@ private:
             iss >> filename;
             handleInfo(filename);
         }
+        else if (cmd == "DOWNLOAD") {
+            std::string filename;
+            iss >> filename;
+            handleDownload(filename);
+        }
         else if (cmd == "HELP") {
             std::string help = 
                 "Available Commands:\n"
-                "  LIST           - List all files in shared directory\n"
-                "  INFO <file>    - Get detailed info about a file\n"
-                "  HELP           - Show this help message\n"
-                "  EXIT           - Disconnect from server\n";
+                "  LIST              - List all files in shared directory\n"
+                "  INFO <file>       - Get detailed info about a file\n"
+                "  DOWNLOAD <file>   - Download a file from server\n"
+                "  HELP              - Show this help message\n"
+                "  EXIT              - Disconnect from server\n";
             sendMessage(help);
         }
         else if (cmd == "EXIT") {
@@ -223,13 +305,11 @@ public:
             }
         }
 
-        // Create socket
         if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
             perror("Socket creation failed");
             return false;
         }
 
-        // Set socket options
         int opt = 1;
         if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT,
                        &opt, sizeof(opt))) {
@@ -237,18 +317,15 @@ public:
             return false;
         }
 
-        // Configure address
         address.sin_family = AF_INET;
         address.sin_addr.s_addr = INADDR_ANY;
         address.sin_port = htons(PORT);
 
-        // Bind
         if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
             perror("Bind failed");
             return false;
         }
 
-        // Listen
         if (listen(server_fd, 3) < 0) {
             perror("Listen failed");
             return false;
@@ -279,7 +356,6 @@ public:
     void handleClient() {
         char buffer[BUFFER_SIZE] = {0};
         
-        // Send welcome message
         std::string welcome = 
             "=== Welcome to File Sharing Server ===\n"
             "Type HELP to see available commands\n\n";
@@ -296,7 +372,6 @@ public:
             }
 
             std::string command(buffer);
-            // Remove trailing newline
             if (!command.empty() && command.back() == '\n') {
                 command.pop_back();
             }
@@ -335,7 +410,7 @@ public:
 };
 
 int main() {
-    std::cout << "=== File Sharing Server (Day 2) ===" << std::endl;
+    std::cout << "=== File Sharing Server (Day 3) ===" << std::endl;
     
     FileServer server;
     server.run();
