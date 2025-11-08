@@ -1,4 +1,4 @@
-// client.cpp - File Sharing Client (Day 4: File Upload)
+// client.cpp - File Sharing Client (Day 5: Authentication & Security)
 #include <iostream>
 #include <cstring>
 #include <sys/socket.h>
@@ -10,6 +10,7 @@
 #include <iomanip>
 #include <sys/stat.h>
 #include <dirent.h>
+#include <termios.h>
 
 #define PORT 8080
 #define BUFFER_SIZE 4096
@@ -21,6 +22,26 @@ private:
     int sock;
     struct sockaddr_in serv_addr;
     bool connected;
+    bool authenticated;
+    std::string username;
+
+    std::string getPassword() {
+        // Disable echo for password input
+        termios oldt;
+        tcgetattr(STDIN_FILENO, &oldt);
+        termios newt = oldt;
+        newt.c_lflag &= ~ECHO;
+        tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+
+        std::string password;
+        std::getline(std::cin, password);
+
+        // Re-enable echo
+        tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+        std::cout << std::endl;
+
+        return password;
+    }
 
     long getFileSize(const std::string& filepath) {
         struct stat st;
@@ -62,18 +83,90 @@ private:
         return std::string(buffer);
     }
 
+    void displayLoginMenu() {
+        std::cout << "\n╔════════════════════════════════════════╗" << std::endl;
+        std::cout << "║    Secure File Sharing - Login         ║" << std::endl;
+        std::cout << "╠════════════════════════════════════════╣" << std::endl;
+        std::cout << "║  1. LOGIN  - Authenticate              ║" << std::endl;
+        std::cout << "║  2. HELP   - Show commands             ║" << std::endl;
+        std::cout << "║  3. EXIT   - Disconnect                ║" << std::endl;
+        std::cout << "╚════════════════════════════════════════╝" << std::endl;
+        std::cout << "\nDefault accounts:" << std::endl;
+        std::cout << "  admin/admin123 (full access)" << std::endl;
+        std::cout << "  user/user123 (download only)" << std::endl;
+        std::cout << "  uploader/upload123 (upload only)" << std::endl;
+        std::cout << "\nEnter command or number: ";
+    }
+
     void displayMenu() {
         std::cout << "\n╔════════════════════════════════════════╗" << std::endl;
         std::cout << "║    File Sharing Client - Menu          ║" << std::endl;
+        std::cout << "║    Logged in as: " << std::left << std::setw(21) << username << "║" << std::endl;
         std::cout << "╠════════════════════════════════════════╣" << std::endl;
         std::cout << "║  1. LIST     - List server files       ║" << std::endl;
         std::cout << "║  2. INFO     - Get file information    ║" << std::endl;
         std::cout << "║  3. DOWNLOAD - Download from server    ║" << std::endl;
         std::cout << "║  4. UPLOAD   - Upload to server        ║" << std::endl;
-        std::cout << "║  5. HELP     - Show server commands    ║" << std::endl;
-        std::cout << "║  6. EXIT     - Disconnect              ║" << std::endl;
+        std::cout << "║  5. LOGOUT   - Logout                  ║" << std::endl;
+        std::cout << "║  6. HELP     - Show commands           ║" << std::endl;
+        std::cout << "║  7. EXIT     - Disconnect              ║" << std::endl;
         std::cout << "╚════════════════════════════════════════╝" << std::endl;
         std::cout << "\nEnter command or number: ";
+    }
+
+    void handleLogin() {
+        std::cout << "\n🔐 Login to Secure File Server" << std::endl;
+        std::cout << std::string(40, '-') << std::endl;
+        
+        std::cout << "Username: ";
+        std::string user;
+        std::getline(std::cin, user);
+        
+        if (user.empty()) {
+            std::cout << "Error: Username cannot be empty" << std::endl;
+            return;
+        }
+        
+        std::cout << "Password: ";
+        std::string pass = getPassword();
+        
+        if (pass.empty()) {
+            std::cout << "Error: Password cannot be empty" << std::endl;
+            return;
+        }
+        
+        std::cout << "\n🔄 Authenticating..." << std::endl;
+        
+        std::string credentials = user + ":" + pass;
+        std::string command = "LOGIN " + credentials + "\n";
+        sendCommand(command);
+        
+        std::string response = receiveResponse();
+        if (!response.empty()) {
+            std::cout << "\n" << response;
+            
+            if (response.find("OK") != std::string::npos) {
+                authenticated = true;
+                username = user;
+                std::cout << "\n✓ Authentication successful!" << std::endl;
+            } else {
+                std::cout << "\n✗ Authentication failed!" << std::endl;
+            }
+        }
+    }
+
+    void handleLogout() {
+        std::cout << "\n👋 Logging out..." << std::endl;
+        sendCommand("LOGOUT\n");
+        
+        std::string response = receiveResponse();
+        if (!response.empty()) {
+            std::cout << response;
+        }
+        
+        authenticated = false;
+        username = "";
+        std::cout << "✓ Logged out successfully" << std::endl;
     }
 
     void handleListCommand() {
@@ -239,7 +332,7 @@ private:
             }
             
             if (entry->d_type == DT_DIR) {
-                continue; // Skip directories
+                continue;
             }
             
             std::string filepath = std::string(UPLOAD_DIR) + "/" + entry->d_name;
@@ -256,10 +349,8 @@ private:
     }
 
     void handleUploadCommand() {
-        // Create upload directory if doesn't exist
         system(("mkdir -p " + std::string(UPLOAD_DIR)).c_str());
         
-        // Show available files
         listLocalFiles();
         
         std::cout << "\nEnter filename to upload (from " << UPLOAD_DIR << "): ";
@@ -273,7 +364,6 @@ private:
         
         std::string filepath = std::string(UPLOAD_DIR) + "/" + filename;
         
-        // Check if file exists
         std::ifstream file(filepath, std::ios::binary);
         if (!file.is_open()) {
             std::cout << "Error: File not found: " << filepath << std::endl;
@@ -281,7 +371,6 @@ private:
             return;
         }
         
-        // Get file size
         file.seekg(0, std::ios::end);
         long filesize = file.tellg();
         file.seekg(0, std::ios::beg);
@@ -289,28 +378,29 @@ private:
         std::cout << "\n📤 Uploading: " << filename 
                   << " (" << formatFileSize(filesize) << ")" << std::endl;
         
-        // Send upload command
         std::string command = "UPLOAD " + filename + "\n";
         sendCommand(command);
         
-        // Wait for server ready signal
         char buffer[BUFFER_SIZE] = {0};
         int bytes_read = read(sock, buffer, BUFFER_SIZE);
         
         if (bytes_read <= 0 || strncmp(buffer, "READY", 5) != 0) {
-            std::cout << "Error: Server not ready" << std::endl;
+            std::string response(buffer);
+            if (response.find("ERROR") != std::string::npos) {
+                std::cout << response << std::endl;
+            } else {
+                std::cout << "Error: Server not ready" << std::endl;
+            }
             file.close();
             return;
         }
         
-        // Send file metadata
         std::ostringstream metadata;
         metadata << "FILESIZE:" << filesize << "\n";
         metadata << "FILENAME:" << filename << "\n";
         metadata << "START\n";
         sendCommand(metadata.str());
         
-        // Wait for acknowledgment
         memset(buffer, 0, BUFFER_SIZE);
         bytes_read = read(sock, buffer, BUFFER_SIZE);
         
@@ -320,10 +410,8 @@ private:
             return;
         }
         
-        // Send file data
         char data_buffer[BUFFER_SIZE];
         long bytes_sent = 0;
-        int chunk_count = 0;
         
         std::cout << "\n🔄 Uploading..." << std::endl;
         std::cout << "Progress: [" << std::flush;
@@ -342,7 +430,6 @@ private:
                     return;
                 }
                 bytes_sent += sent;
-                chunk_count++;
                 
                 int progress = (bytes_sent * 50) / filesize;
                 if (progress != last_progress) {
@@ -357,7 +444,6 @@ private:
         std::cout << "] 100%" << std::endl;
         file.close();
         
-        // Wait for server confirmation
         memset(buffer, 0, BUFFER_SIZE);
         bytes_read = read(sock, buffer, BUFFER_SIZE);
         
@@ -385,12 +471,19 @@ private:
     }
 
     std::string normalizeCommand(const std::string& input) {
-        if (input == "1") return "LIST";
-        if (input == "2") return "INFO";
-        if (input == "3") return "DOWNLOAD";
-        if (input == "4") return "UPLOAD";
-        if (input == "5") return "HELP";
-        if (input == "6") return "EXIT";
+        if (!authenticated) {
+            if (input == "1") return "LOGIN";
+            if (input == "2") return "HELP";
+            if (input == "3") return "EXIT";
+        } else {
+            if (input == "1") return "LIST";
+            if (input == "2") return "INFO";
+            if (input == "3") return "DOWNLOAD";
+            if (input == "4") return "UPLOAD";
+            if (input == "5") return "LOGOUT";
+            if (input == "6") return "HELP";
+            if (input == "7") return "EXIT";
+        }
         
         std::string upper = input;
         for (char& c : upper) {
@@ -400,7 +493,7 @@ private:
     }
 
 public:
-    FileClient() : sock(0), connected(false) {
+    FileClient() : sock(0), connected(false), authenticated(false), username("") {
         serv_addr = {};
     }
 
@@ -438,7 +531,11 @@ public:
         }
 
         while (connected) {
-            displayMenu();
+            if (!authenticated) {
+                displayLoginMenu();
+            } else {
+                displayMenu();
+            }
             
             std::string input;
             std::getline(std::cin, input);
@@ -449,7 +546,10 @@ public:
 
             std::string command = normalizeCommand(input);
 
-            if (command == "LIST") {
+            if (command == "LOGIN") {
+                handleLogin();
+            }
+            else if (command == "LIST") {
                 handleListCommand();
             }
             else if (command == "INFO") {
@@ -460,6 +560,9 @@ public:
             }
             else if (command == "UPLOAD") {
                 handleUploadCommand();
+            }
+            else if (command == "LOGOUT") {
+                handleLogout();
             }
             else if (command == "HELP") {
                 handleHelpCommand();
@@ -489,7 +592,7 @@ public:
 
 int main(int argc, char const *argv[]) {
     std::cout << "╔════════════════════════════════════════╗" << std::endl;
-    std::cout << "║   File Sharing Client (Day 4)          ║" << std::endl;
+    std::cout << "║   Secure File Sharing Client (Day 5)   ║" << std::endl;
     std::cout << "╚════════════════════════════════════════╝" << std::endl;
     
     const char* server_ip = "127.0.0.1";

@@ -16,3 +16,6 @@ Thumbs.db
 *.swp
 *.swo
 *~
+users.txt
+server.log
+*.log

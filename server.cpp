@@ -1,4 +1,4 @@
-// server.cpp - File Sharing Server (Day 4: File Upload)
+// server.cpp - File Sharing Server (Day 5: Authentication & Security)
 #include <iostream>
 #include <cstring>
 #include <sys/socket.h>
@@ -12,11 +12,15 @@
 #include <sstream>
 #include <iomanip>
 #include <fstream>
+#include <map>
+#include <ctime>
 
 #define PORT 8080
 #define BUFFER_SIZE 4096
 #define SHARED_DIR "./shared_files"
 #define CHUNK_SIZE 4096
+#define LOG_FILE "./server.log"
+#define USERS_FILE "./users.txt"
 
 struct FileInfo {
     std::string name;
@@ -25,12 +29,92 @@ struct FileInfo {
     std::string permissions;
 };
 
+struct User {
+    std::string username;
+    std::string password;
+    bool can_upload;
+    bool can_download;
+};
+
 class FileServer {
 private:
     int server_fd;
     int client_socket;
     struct sockaddr_in address;
     int addrlen;
+    std::map<std::string, User> users;
+    bool is_authenticated;
+    std::string current_user;
+    std::string client_ip;
+
+    void logActivity(const std::string& activity) {
+        std::ofstream logfile(LOG_FILE, std::ios::app);
+        if (logfile.is_open()) {
+            time_t now = time(0);
+            char* dt = ctime(&now);
+            std::string timestamp(dt);
+            timestamp.pop_back(); // Remove newline
+            
+            logfile << "[" << timestamp << "] "
+                   << "[" << client_ip << "] "
+                   << "[" << (is_authenticated ? current_user : "ANONYMOUS") << "] "
+                   << activity << std::endl;
+            logfile.close();
+        }
+    }
+
+    void loadUsers() {
+        std::ifstream userfile(USERS_FILE);
+        if (!userfile.is_open()) {
+            // Create default users file
+            std::ofstream outfile(USERS_FILE);
+            if (outfile.is_open()) {
+                outfile << "admin:admin123:1:1\n";
+                outfile << "user:user123:0:1\n";
+                outfile << "uploader:upload123:1:0\n";
+                outfile.close();
+                std::cout << "✓ Created default users file" << std::endl;
+                std::cout << "  Default users: admin/admin123, user/user123, uploader/upload123" << std::endl;
+            }
+            userfile.open(USERS_FILE);
+        }
+
+        if (userfile.is_open()) {
+            std::string line;
+            while (std::getline(userfile, line)) {
+                std::istringstream iss(line);
+                std::string username, password, upload, download;
+                
+                if (std::getline(iss, username, ':') &&
+                    std::getline(iss, password, ':') &&
+                    std::getline(iss, upload, ':') &&
+                    std::getline(iss, download)) {
+                    
+                    User user;
+                    user.username = username;
+                    user.password = password;
+                    user.can_upload = (upload == "1");
+                    user.can_download = (download == "1");
+                    
+                    users[username] = user;
+                }
+            }
+            userfile.close();
+            std::cout << "✓ Loaded " << users.size() << " users" << std::endl;
+        }
+    }
+
+    bool authenticateUser(const std::string& username, const std::string& password) {
+        auto it = users.find(username);
+        if (it != users.end() && it->second.password == password) {
+            current_user = username;
+            is_authenticated = true;
+            logActivity("LOGIN SUCCESS");
+            return true;
+        }
+        logActivity("LOGIN FAILED - User: " + username);
+        return false;
+    }
 
     long getFileSize(const std::string& filepath) {
         struct stat st;
@@ -81,7 +165,6 @@ private:
         DIR* dir = opendir(SHARED_DIR);
         
         if (!dir) {
-            std::cerr << "Error: Cannot open shared directory" << std::endl;
             return files;
         }
         
@@ -106,7 +189,36 @@ private:
         return files;
     }
 
+    void handleLogin(const std::string& credentials) {
+        std::istringstream iss(credentials);
+        std::string username, password;
+        
+        if (std::getline(iss, username, ':') && std::getline(iss, password)) {
+            if (authenticateUser(username, password)) {
+                std::ostringstream response;
+                response << "OK\n";
+                response << "Login successful! Welcome, " << current_user << "\n";
+                response << "Permissions:\n";
+                response << "  - Upload: " << (users[current_user].can_upload ? "YES" : "NO") << "\n";
+                response << "  - Download: " << (users[current_user].can_download ? "YES" : "NO") << "\n";
+                sendMessage(response.str());
+                std::cout << "✓ User authenticated: " << current_user << std::endl;
+            } else {
+                sendMessage("ERROR: Invalid username or password\n");
+                std::cout << "✗ Authentication failed" << std::endl;
+            }
+        } else {
+            sendMessage("ERROR: Invalid login format\n");
+        }
+    }
+
     void handleList() {
+        if (!is_authenticated) {
+            sendMessage("ERROR: Authentication required\n");
+            logActivity("UNAUTHORIZED ACCESS - LIST");
+            return;
+        }
+
         std::vector<FileInfo> files = listFiles();
         
         if (files.empty()) {
@@ -135,9 +247,16 @@ private:
         response << "Total: " << files.size() << " items\n";
         
         sendMessage(response.str());
+        logActivity("LIST - " + std::to_string(files.size()) + " items");
     }
 
     void handleInfo(const std::string& filename) {
+        if (!is_authenticated) {
+            sendMessage("ERROR: Authentication required\n");
+            logActivity("UNAUTHORIZED ACCESS - INFO");
+            return;
+        }
+
         if (filename.empty()) {
             sendMessage("ERROR: Filename required\n");
             return;
@@ -162,9 +281,22 @@ private:
         response << std::string(40, '-') << "\n";
         
         sendMessage(response.str());
+        logActivity("INFO - " + filename);
     }
 
     void handleDownload(const std::string& filename) {
+        if (!is_authenticated) {
+            sendMessage("ERROR: Authentication required\n");
+            logActivity("UNAUTHORIZED ACCESS - DOWNLOAD");
+            return;
+        }
+
+        if (!users[current_user].can_download) {
+            sendMessage("ERROR: Permission denied - You cannot download files\n");
+            logActivity("PERMISSION DENIED - DOWNLOAD - " + filename);
+            return;
+        }
+        
         if (filename.empty()) {
             sendMessage("ERROR: Filename required\n");
             return;
@@ -175,7 +307,6 @@ private:
         std::ifstream file(filepath, std::ios::binary);
         if (!file.is_open()) {
             sendMessage("ERROR: File not found or cannot be opened\n");
-            std::cerr << "Failed to open file: " << filepath << std::endl;
             return;
         }
         
@@ -190,7 +321,7 @@ private:
             return;
         }
         
-        std::cout << "📤 Starting download: " << filename 
+        std::cout << "📤 " << current_user << " downloading: " << filename 
                   << " (" << formatFileSize(filesize) << ")" << std::endl;
         
         std::ostringstream metadata;
@@ -204,14 +335,12 @@ private:
         read(client_socket, ack, sizeof(ack));
         
         if (strncmp(ack, "READY", 5) != 0) {
-            std::cerr << "Client not ready to receive file" << std::endl;
             file.close();
             return;
         }
         
         char buffer[CHUNK_SIZE];
         long bytes_sent = 0;
-        int chunk_count = 0;
         
         while (!file.eof() && bytes_sent < filesize) {
             file.read(buffer, CHUNK_SIZE);
@@ -219,48 +348,44 @@ private:
             
             if (bytes_read > 0) {
                 ssize_t sent = send(client_socket, buffer, bytes_read, 0);
-                if (sent < 0) {
-                    std::cerr << "Error sending file data" << std::endl;
-                    break;
-                }
+                if (sent < 0) break;
                 bytes_sent += sent;
-                chunk_count++;
-                
-                int progress = (bytes_sent * 100) / filesize;
-                if (chunk_count % 100 == 0 || bytes_sent >= filesize) {
-                    std::cout << "Progress: " << progress << "% (" 
-                              << formatFileSize(bytes_sent) << " / " 
-                              << formatFileSize(filesize) << ")\r" << std::flush;
-                }
             }
         }
         
         file.close();
-        std::cout << "\n✓ Download complete: " << filename 
-                  << " (" << bytes_sent << " bytes sent)" << std::endl;
+        std::cout << "✓ Download complete: " << filename << std::endl;
+        logActivity("DOWNLOAD - " + filename + " (" + std::to_string(bytes_sent) + " bytes)");
     }
 
     void handleUpload(const std::string& filename) {
+        if (!is_authenticated) {
+            sendMessage("ERROR: Authentication required\n");
+            logActivity("UNAUTHORIZED ACCESS - UPLOAD");
+            return;
+        }
+
+        if (!users[current_user].can_upload) {
+            sendMessage("ERROR: Permission denied - You cannot upload files\n");
+            logActivity("PERMISSION DENIED - UPLOAD - " + filename);
+            return;
+        }
+        
         if (filename.empty()) {
             sendMessage("ERROR: Filename required\n");
             return;
         }
         
-        // Send ready signal to receive metadata
         sendMessage("READY\n");
         
-        // Receive file metadata
         char buffer[BUFFER_SIZE] = {0};
         int bytes_read = read(client_socket, buffer, BUFFER_SIZE);
         
         if (bytes_read <= 0) {
-            std::cerr << "Failed to receive file metadata" << std::endl;
             return;
         }
         
         std::string metadata(buffer);
-        
-        // Parse metadata
         std::istringstream iss(metadata);
         std::string line;
         long filesize = 0;
@@ -283,26 +408,21 @@ private:
             return;
         }
         
-        std::cout << "📥 Receiving upload: " << recv_filename 
+        std::cout << "📥 " << current_user << " uploading: " << recv_filename 
                   << " (" << formatFileSize(filesize) << ")" << std::endl;
         
-        // Open file for writing
         std::string filepath = std::string(SHARED_DIR) + "/" + recv_filename;
         std::ofstream outfile(filepath, std::ios::binary);
         
         if (!outfile.is_open()) {
             sendMessage("ERROR: Cannot create file\n");
-            std::cerr << "Failed to create file: " << filepath << std::endl;
             return;
         }
         
-        // Send acknowledgment
         send(client_socket, "READY", 5, 0);
         
-        // Receive file data
         long bytes_received = 0;
         char data_buffer[CHUNK_SIZE];
-        int chunk_count = 0;
         
         while (bytes_received < filesize) {
             memset(data_buffer, 0, CHUNK_SIZE);
@@ -313,7 +433,6 @@ private:
             int received = read(client_socket, data_buffer, to_read);
             
             if (received <= 0) {
-                std::cerr << "\nError receiving file data" << std::endl;
                 outfile.close();
                 sendMessage("ERROR: Upload failed\n");
                 return;
@@ -321,23 +440,13 @@ private:
             
             outfile.write(data_buffer, received);
             bytes_received += received;
-            chunk_count++;
-            
-            // Progress indicator
-            int progress = (bytes_received * 100) / filesize;
-            if (chunk_count % 100 == 0 || bytes_received >= filesize) {
-                std::cout << "Progress: " << progress << "% (" 
-                          << formatFileSize(bytes_received) << " / " 
-                          << formatFileSize(filesize) << ")\r" << std::flush;
-            }
         }
         
         outfile.close();
         
-        std::cout << "\n✓ Upload complete: " << recv_filename 
-                  << " (" << bytes_received << " bytes received)" << std::endl;
+        std::cout << "✓ Upload complete: " << recv_filename << std::endl;
+        logActivity("UPLOAD - " + recv_filename + " (" + std::to_string(bytes_received) + " bytes)");
         
-        // Send success confirmation
         sendMessage("OK: Upload successful\n");
     }
 
@@ -350,9 +459,19 @@ private:
         std::string cmd;
         iss >> cmd;
         
-        std::cout << "Processing command: " << cmd << std::endl;
+        std::cout << "Processing command: " << cmd;
+        if (is_authenticated) {
+            std::cout << " [User: " << current_user << "]";
+        }
+        std::cout << std::endl;
         
-        if (cmd == "LIST") {
+        if (cmd == "LOGIN") {
+            std::string credentials;
+            std::getline(iss, credentials);
+            credentials = credentials.substr(1); // Remove leading space
+            handleLogin(credentials);
+        }
+        else if (cmd == "LIST") {
             handleList();
         } 
         else if (cmd == "INFO") {
@@ -370,18 +489,40 @@ private:
             iss >> filename;
             handleUpload(filename);
         }
+        else if (cmd == "LOGOUT") {
+            if (is_authenticated) {
+                logActivity("LOGOUT");
+                std::cout << "✓ User logged out: " << current_user << std::endl;
+                current_user = "";
+                is_authenticated = false;
+                sendMessage("OK: Logged out successfully\n");
+            } else {
+                sendMessage("ERROR: Not logged in\n");
+            }
+        }
         else if (cmd == "HELP") {
-            std::string help = 
-                "Available Commands:\n"
-                "  LIST              - List all files in shared directory\n"
-                "  INFO <file>       - Get detailed info about a file\n"
-                "  DOWNLOAD <file>   - Download a file from server\n"
-                "  UPLOAD <file>     - Upload a file to server\n"
-                "  HELP              - Show this help message\n"
-                "  EXIT              - Disconnect from server\n";
+            std::string help;
+            if (!is_authenticated) {
+                help = "Available Commands:\n"
+                       "  LOGIN <user>:<pass> - Authenticate with server\n"
+                       "  HELP                - Show this help message\n"
+                       "  EXIT                - Disconnect from server\n";
+            } else {
+                help = "Available Commands:\n"
+                       "  LIST                - List all files\n"
+                       "  INFO <file>         - Get file information\n"
+                       "  DOWNLOAD <file>     - Download a file\n"
+                       "  UPLOAD <file>       - Upload a file\n"
+                       "  LOGOUT              - Logout from server\n"
+                       "  HELP                - Show this help\n"
+                       "  EXIT                - Disconnect\n";
+            }
             sendMessage(help);
         }
         else if (cmd == "EXIT") {
+            if (is_authenticated) {
+                logActivity("DISCONNECT");
+            }
             sendMessage("Goodbye!\n");
         }
         else {
@@ -390,17 +531,18 @@ private:
     }
 
 public:
-    FileServer() : server_fd(0), client_socket(0), addrlen(sizeof(address)) {
+    FileServer() : server_fd(0), client_socket(0), addrlen(sizeof(address)), 
+                   is_authenticated(false), current_user(""), client_ip("") {
         address = {};
     }
 
     bool initialize() {
+        loadUsers();
+        
         struct stat st = {0};
         if (stat(SHARED_DIR, &st) == -1) {
             if (mkdir(SHARED_DIR, 0755) == 0) {
                 std::cout << "✓ Created shared directory: " << SHARED_DIR << std::endl;
-            } else {
-                std::cerr << "✗ Failed to create shared directory" << std::endl;
             }
         }
 
@@ -433,6 +575,7 @@ public:
         std::cout << "✓ Server initialized successfully" << std::endl;
         std::cout << "✓ Listening on port " << PORT << std::endl;
         std::cout << "✓ Shared directory: " << SHARED_DIR << std::endl;
+        std::cout << "✓ Logging to: " << LOG_FILE << std::endl;
         return true;
     }
 
@@ -445,18 +588,24 @@ public:
             return;
         }
 
-        char client_ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &(address.sin_addr), client_ip, INET_ADDRSTRLEN);
+        char ip_buffer[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &(address.sin_addr), ip_buffer, INET_ADDRSTRLEN);
+        client_ip = std::string(ip_buffer);
         
         std::cout << "✓ Client connected from " << client_ip 
                   << ":" << ntohs(address.sin_port) << std::endl;
+        
+        is_authenticated = false;
+        current_user = "";
+        logActivity("CONNECTED");
     }
 
     void handleClient() {
         char buffer[BUFFER_SIZE] = {0};
         
         std::string welcome = 
-            "=== Welcome to File Sharing Server ===\n"
+            "=== Secure File Sharing Server ===\n"
+            "Please login to continue.\n"
             "Type HELP to see available commands\n\n";
         sendMessage(welcome);
 
@@ -467,6 +616,9 @@ public:
             
             if (bytes_read <= 0) {
                 std::cout << "✗ Client disconnected" << std::endl;
+                if (is_authenticated) {
+                    logActivity("DISCONNECTED");
+                }
                 break;
             }
 
@@ -474,8 +626,6 @@ public:
             if (!command.empty() && command.back() == '\n') {
                 command.pop_back();
             }
-
-            std::cout << "Received: " << command << std::endl;
 
             if (command == "EXIT") {
                 sendMessage("Goodbye!\n");
@@ -509,7 +659,7 @@ public:
 };
 
 int main() {
-    std::cout << "=== File Sharing Server (Day 4) ===" << std::endl;
+    std::cout << "=== Secure File Sharing Server (Day 5) ===" << std::endl;
     
     FileServer server;
     server.run();
